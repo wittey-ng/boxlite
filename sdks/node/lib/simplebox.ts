@@ -39,6 +39,9 @@ export interface SimpleBoxOptions {
   /** Remove box when stopped (default: true) */
   autoRemove?: boolean;
 
+  /** If true, reuse an existing box with the same name instead of failing (default: false) */
+  reuseExisting?: boolean;
+
   /** Run box in detached mode (survives parent process exit, default: false) */
   detach?: boolean;
 
@@ -61,6 +64,38 @@ export interface SimpleBoxOptions {
     guestPort: number;
     protocol?: string;
   }>;
+
+  /**
+   * Override image ENTRYPOINT directive.
+   *
+   * When set, completely replaces the image's ENTRYPOINT.
+   * Use with `cmd` to build the full command:
+   *   Final execution = entrypoint + cmd
+   *
+   * Example: For `docker:dind`, bypass the failing entrypoint script:
+   *   `entrypoint: ["dockerd"]`, `cmd: ["--iptables=false"]`
+   */
+  entrypoint?: string[];
+
+  /**
+   * Override image CMD directive.
+   *
+   * The image ENTRYPOINT is preserved; these args replace the image's CMD.
+   * Final execution = image_entrypoint + cmd.
+   *
+   * Example: For `docker:dind` (ENTRYPOINT=["dockerd-entrypoint.sh"]),
+   * setting `cmd: ["--iptables=false"]` produces:
+   * `["dockerd-entrypoint.sh", "--iptables=false"]`
+   */
+  cmd?: string[];
+
+  /**
+   * Override container user (UID/GID).
+   *
+   * Format: "uid", "uid:gid", or "username".
+   * If not set, uses the image's USER directive (defaults to root "0:0").
+   */
+  user?: string;
 }
 
 /**
@@ -107,6 +142,8 @@ export class SimpleBox {
   protected _boxPromise: Promise<Box> | null = null;
   protected _name?: string;
   protected _boxOpts: BoxOptions;
+  protected _reuseExisting: boolean;
+  protected _created: boolean | null = null;
 
   /**
    * Create a new SimpleBox.
@@ -148,9 +185,13 @@ export class SimpleBox {
         : undefined,
       volumes: options.volumes,
       ports: options.ports,
+      entrypoint: options.entrypoint,
+      cmd: options.cmd,
+      user: options.user,
     };
 
     this._name = options.name;
+    this._reuseExisting = options.reuseExisting ?? false;
   }
 
   /**
@@ -164,7 +205,16 @@ export class SimpleBox {
 
     // Avoid race condition with concurrent calls
     if (!this._boxPromise) {
-      this._boxPromise = this._runtime.create(this._boxOpts, this._name);
+      this._boxPromise = (async () => {
+        if (this._reuseExisting) {
+          const result = await this._runtime.getOrCreate(this._boxOpts, this._name);
+          this._created = result.created;
+          return result.box;
+        } else {
+          this._created = true;
+          return this._runtime.create(this._boxOpts, this._name);
+        }
+      })();
     }
 
     this._box = await this._boxPromise;
@@ -196,6 +246,15 @@ export class SimpleBox {
    */
   get name(): string | undefined {
     return this._name;
+  }
+
+  /**
+   * Whether this box was newly created (true) or an existing box was reused (false).
+   *
+   * Returns null if the box hasn't been created yet.
+   */
+  get created(): boolean | null {
+    return this._created;
   }
 
   /**

@@ -74,13 +74,14 @@ mod pre_exec;
 
 // Platform-specific modules
 pub mod platform;
-pub mod seccomp;
 
 // Linux-only modules
 #[cfg(target_os = "linux")]
 pub(crate) mod bwrap;
 #[cfg(target_os = "linux")]
 pub(crate) mod cgroup;
+#[cfg(target_os = "linux")]
+pub mod seccomp;
 #[cfg(target_os = "linux")]
 pub(crate) mod shim_copy;
 

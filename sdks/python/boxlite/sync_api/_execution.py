@@ -4,13 +4,44 @@ SyncExecution - Synchronous wrapper for Execution.
 Mirrors the native Execution API exactly, but with synchronous methods.
 """
 
-from typing import TYPE_CHECKING, Optional, Iterator
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from ._boxlite import SyncBoxlite
     from ..boxlite import Execution
 
-__all__ = ["SyncExecution", "SyncExecStdout", "SyncExecStderr"]
+__all__ = ["SyncExecution", "SyncExecStdin", "SyncExecStdout", "SyncExecStderr"]
+
+
+class SyncExecStdin:
+    """
+    Synchronous wrapper for execution stdin.
+
+    Usage:
+        stdin = execution.stdin()
+        stdin.send_input(b"hello\\n")
+        stdin.close()
+    """
+
+    def __init__(self, ctx: "SyncBoxlite", async_stdin) -> None:
+        self._ctx = ctx
+        self._async_stdin = async_stdin
+
+        from ._sync_base import SyncBase
+
+        self._sync_helper = SyncBase(async_stdin, ctx.loop, ctx.dispatcher_fiber)
+
+    def _sync(self, coro):
+        """Run async operation synchronously."""
+        return self._sync_helper._sync(coro)
+
+    def send_input(self, data: bytes) -> None:
+        """Write data to stdin."""
+        self._sync(self._async_stdin.send_input(data))
+
+    def close(self) -> None:
+        """Close stdin stream, signaling EOF to the process."""
+        self._sync(self._async_stdin.close())
 
 
 class SyncExecStdout:
@@ -31,6 +62,7 @@ class SyncExecStdout:
         self._async_iter = None
 
         from ._sync_base import SyncBase
+
         self._sync_helper = SyncBase(async_stdout, ctx.loop, ctx.dispatcher_fiber)
 
     def _sync(self, coro):
@@ -75,6 +107,7 @@ class SyncExecStderr:
         self._async_iter = None
 
         from ._sync_base import SyncBase
+
         self._sync_helper = SyncBase(async_stderr, ctx.loop, ctx.dispatcher_fiber)
 
     def _sync(self, coro):
@@ -150,6 +183,24 @@ class SyncExecution:
     def id(self) -> str:
         """Get the execution ID."""
         return self._execution.id
+
+    def stdin(self) -> Optional[SyncExecStdin]:
+        """
+        Get synchronous stdin writer.
+
+        Returns:
+            SyncExecStdin writer, or None if stdin is not available.
+
+        Usage:
+            stdin = execution.stdin()
+            if stdin:
+                stdin.send_input(b"hello\\n")
+                stdin.close()
+        """
+        async_stdin = self._execution.stdin()
+        if async_stdin is None:
+            return None
+        return SyncExecStdin(self._ctx, async_stdin)
 
     def stdout(self) -> Optional[SyncExecStdout]:
         """

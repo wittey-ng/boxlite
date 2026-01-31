@@ -77,6 +77,25 @@ pub struct JsBoxOptions {
 
     /// Run box in detached mode (survives parent process exit, default: false)
     pub detach: Option<bool>,
+
+    /// Override image ENTRYPOINT directive.
+    ///
+    /// When set, completely replaces the image's ENTRYPOINT.
+    /// Use with `cmd` to build the full command:
+    ///   Final execution = entrypoint + cmd
+    pub entrypoint: Option<Vec<String>>,
+
+    /// Override image CMD directive.
+    ///
+    /// The image ENTRYPOINT is preserved; these args replace the image's CMD.
+    /// Final execution = image_entrypoint + cmd.
+    pub cmd: Option<Vec<String>>,
+
+    /// Override container user (UID/GID).
+    ///
+    /// Format: "uid", "uid:gid", or "username".
+    /// If None, uses the image's USER directive (defaults to root).
+    pub user: Option<String>,
 }
 
 /// Environment variable specification.
@@ -120,15 +139,18 @@ impl From<JsVolumeSpec> for VolumeSpec {
 #[derive(Clone, Debug)]
 pub struct JsPortSpec {
     /// Port on host (None = auto-assign)
+    #[napi(js_name = "hostPort")]
     pub host_port: Option<u16>,
 
     /// Port inside container
+    #[napi(js_name = "guestPort")]
     pub guest_port: u16,
 
     /// Protocol ("tcp" or "udp", default: "tcp")
     pub protocol: Option<String>,
 
     /// Bind IP address (default: 0.0.0.0)
+    #[napi(js_name = "hostIp")]
     pub host_ip: Option<String>,
 }
 
@@ -206,6 +228,9 @@ impl From<JsBoxOptions> for BoxOptions {
             auto_remove: js_opts.auto_remove.unwrap_or(false),
             detach: js_opts.detach.unwrap_or(false),
             security: Default::default(), // Use default security options
+            entrypoint: js_opts.entrypoint,
+            cmd: js_opts.cmd,
+            user: js_opts.user,
         }
     }
 }

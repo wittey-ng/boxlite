@@ -4,6 +4,7 @@ use boxlite::{BoxCommand, LiteBox};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use crate::copy::{JsCopyOptions, into_copy_options};
 use crate::exec::JsExecution;
 use crate::info::JsBoxInfo;
 use crate::metrics::JsBoxMetrics;
@@ -124,6 +125,23 @@ impl JsBox {
         })
     }
 
+    /// Start or restart a stopped box.
+    ///
+    /// Boots the VM for a box that was previously stopped or is in
+    /// configured state. The box's rootfs and configuration are preserved.
+    ///
+    /// # Example
+    /// ```javascript
+    /// // Restart a stopped box
+    /// const box = await runtime.get('box-id');
+    /// await box.start();
+    /// console.log('Box started');
+    /// ```
+    #[napi]
+    pub async fn start(&self) -> Result<()> {
+        self.handle.start().await.map_err(map_err)
+    }
+
     /// Stop the box (preserves state for restart).
     ///
     /// Sends a graceful shutdown signal to the VM. The box's rootfs and
@@ -159,5 +177,43 @@ impl JsBox {
     pub async fn metrics(&self) -> Result<JsBoxMetrics> {
         let metrics = self.handle.metrics().await.map_err(map_err)?;
         Ok(JsBoxMetrics::from(metrics))
+    }
+
+    /// Copy files from host into the box's container rootfs.
+    ///
+    /// **Note:** Destinations under tmpfs mounts (e.g. `/tmp`, `/dev/shm`) will
+    /// silently fail — files land behind the mount and are invisible to the
+    /// container. Same limitation as `docker cp`. Workaround: pipe tar via
+    /// stdin through the box's command execution API.
+    /// See: <https://github.com/moby/moby/issues/22020>
+    #[napi(js_name = "copyIn")]
+    pub async fn copy_in(
+        &self,
+        host_path: String,
+        container_dest: String,
+        options: Option<JsCopyOptions>,
+    ) -> Result<()> {
+        let opts = into_copy_options(options);
+
+        self.handle
+            .copy_into(std::path::Path::new(&host_path), &container_dest, opts)
+            .await
+            .map_err(map_err)
+    }
+
+    /// Copy files from the box's container rootfs to host.
+    #[napi(js_name = "copyOut")]
+    pub async fn copy_out(
+        &self,
+        container_src: String,
+        host_dest: String,
+        options: Option<JsCopyOptions>,
+    ) -> Result<()> {
+        let opts = into_copy_options(options);
+
+        self.handle
+            .copy_out(&container_src, std::path::Path::new(&host_dest), opts)
+            .await
+            .map_err(map_err)
     }
 }

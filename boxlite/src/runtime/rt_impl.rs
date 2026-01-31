@@ -10,6 +10,7 @@ use crate::runtime::guest_rootfs::GuestRootfs;
 use crate::runtime::layout::{FilesystemLayout, FsLayoutConfig};
 use crate::runtime::lock::RuntimeLock;
 use crate::runtime::options::{BoxOptions, BoxliteOptions};
+use crate::runtime::signal_handler::timeout_to_duration;
 use crate::runtime::types::{BoxID, BoxInfo, BoxState, BoxStatus, ContainerID};
 use crate::vmm::VmmKind;
 use boxlite_shared::{BoxliteError, BoxliteResult, Transport};
@@ -17,6 +18,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Weak};
 use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
 
 /// Internal runtime state protected by single lock.
 ///
@@ -64,6 +66,15 @@ pub struct RuntimeImpl {
     /// Runtime filesystem lock (held for lifetime). Prevent from multiple process run on same
     /// BOXLITE_HOME directory
     pub(crate) _runtime_lock: RuntimeLock,
+
+    // ========================================================================
+    // SHUTDOWN COORDINATION
+    // ========================================================================
+    /// Cancellation token for coordinated shutdown.
+    /// When cancelled, all in-flight operations should terminate gracefully.
+    /// Use `.is_cancelled()` for sync checks, `.cancelled()` for async select!.
+    /// Child tokens are passed to each box via `.child_token()`.
+    pub(crate) shutdown_token: CancellationToken,
 }
 
 /// Synchronized state protected by RwLock.
@@ -87,6 +98,15 @@ impl RuntimeImpl {
     ///
     /// Performs all initialization: filesystem setup, locks, managers, and box recovery.
     pub fn new(options: BoxliteOptions) -> BoxliteResult<SharedRuntimeImpl> {
+        let vmm_support = crate::vmm::host_check::check_virtualization_support().map_err(|e| {
+            BoxliteError::Internal(format!("Failed to check virtualization support: {}", e))
+        })?;
+
+        tracing::info!(
+            reason = %vmm_support.reason,
+            "Virtualization support verified"
+        );
+
         // Validate Early: Check preconditions before expensive work
         if !options.home_dir.is_absolute() {
             return Err(BoxliteError::Internal(format!(
@@ -181,6 +201,7 @@ impl RuntimeImpl {
             runtime_metrics: RuntimeMetricsStorage::new(),
             lock_manager,
             _runtime_lock: runtime_lock,
+            shutdown_token: CancellationToken::new(),
         });
 
         tracing::debug!("initialized runtime");
@@ -206,18 +227,59 @@ impl RuntimeImpl {
         options: BoxOptions,
         name: Option<String>,
     ) -> BoxliteResult<LiteBox> {
-        // Check DB for existing name
+        let (litebox, _created) = self.create_inner(options, name, false).await?;
+        Ok(litebox)
+    }
+
+    /// Get an existing box by name, or create a new one if it doesn't exist.
+    ///
+    /// Returns `(LiteBox, true)` if a new box was created, or `(LiteBox, false)`
+    /// if an existing box with the given name was found. When an existing box is
+    /// returned, the provided `options` are ignored (no config drift validation).
+    pub async fn get_or_create(
+        self: &Arc<Self>,
+        options: BoxOptions,
+        name: Option<String>,
+    ) -> BoxliteResult<(LiteBox, bool)> {
+        self.create_inner(options, name, true).await
+    }
+
+    /// Inner create logic shared by `create()` and `get_or_create()`.
+    ///
+    /// When `reuse_existing` is false, returns an error if a box with the same
+    /// name already exists (standard create behavior). When true, returns the
+    /// existing box with `created=false`.
+    async fn create_inner(
+        self: &Arc<Self>,
+        options: BoxOptions,
+        name: Option<String>,
+        reuse_existing: bool,
+    ) -> BoxliteResult<(LiteBox, bool)> {
+        // Check if runtime has been shut down
+        if self.shutdown_token.is_cancelled() {
+            return Err(BoxliteError::Stopped(
+                "Cannot create box: runtime has been shut down".into(),
+            ));
+        }
+
+        // Check DB for existing name — use lookup_box to get full (config, state)
+        // so we can build the LiteBox directly without a second lookup
         if let Some(ref name) = name
-            && self.box_manager.lookup_box_id(name)?.is_some()
+            && let Some((config, state)) = self.box_manager.lookup_box(name)?
         {
-            return Err(BoxliteError::InvalidArgument(format!(
-                "box with name '{}' already exists",
-                name
-            )));
+            if reuse_existing {
+                let (box_impl, _) = self.get_or_create_box_impl(config, state);
+                return Ok((LiteBox::new(box_impl), false));
+            } else {
+                return Err(BoxliteError::InvalidArgument(format!(
+                    "box with name '{}' already exists",
+                    name
+                )));
+            }
         }
 
         // Initialize box variables with defaults
-        let (config, mut state) = self.init_box_variables(&options, name);
+        let (config, mut state) = self.init_box_variables(&options, name.clone());
 
         // Allocate lock for this box
         let lock_id = self.lock_manager.allocate()?;
@@ -233,6 +295,23 @@ impl RuntimeImpl {
                     "Failed to free lock after DB persist error"
                 );
             }
+
+            // TOCTOU race recovery: lookup_box (line ~268) and add_box are
+            // separate non-atomic operations. Between them, another concurrent
+            // caller can complete the full create path and persist first:
+            //
+            //   Task A: lookup("w") → None     Task B: lookup("w") → None
+            //   Task A: add_box() → Ok         Task B: add_box() → Err (duplicate)
+            //
+            // When reuse_existing=true, recover by re-reading the winner's box.
+            if reuse_existing
+                && let Some(ref name) = name
+                && let Some((config, state)) = self.box_manager.lookup_box(name)?
+            {
+                let (box_impl, _) = self.get_or_create_box_impl(config, state);
+                return Ok((LiteBox::new(box_impl), false));
+            }
+
             return Err(e);
         }
 
@@ -256,7 +335,7 @@ impl RuntimeImpl {
             .boxes_created
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        Ok(LiteBox::new(box_impl))
+        Ok((LiteBox::new(box_impl), true))
     }
 
     /// Get a handle to an existing box by ID or name.
@@ -442,6 +521,97 @@ impl RuntimeImpl {
     /// Get runtime-wide metrics.
     pub async fn metrics(&self) -> RuntimeMetrics {
         RuntimeMetrics::new(self.runtime_metrics.clone())
+    }
+
+    // ========================================================================
+    // PUBLIC API - SHUTDOWN
+    // ========================================================================
+
+    /// Gracefully shutdown all boxes in this runtime.
+    ///
+    /// This method:
+    /// 1. Marks the runtime as shut down (no new operations allowed)
+    /// 2. Cancels the shutdown token (signals in-flight operations)
+    /// 3. Stops all active boxes with the given timeout
+    ///
+    /// # Arguments
+    /// * `timeout` - Seconds before force-kill. None=10s, Some(-1)=infinite
+    ///
+    /// # Returns
+    /// Ok(()) if all boxes stopped successfully, Err if any box failed to stop.
+    pub async fn shutdown(&self, timeout: Option<i32>) -> BoxliteResult<()> {
+        // Check if already shut down (idempotent)
+        if self.shutdown_token.is_cancelled() {
+            return Ok(());
+        }
+
+        tracing::info!("Initiating runtime shutdown");
+
+        // Cancel the shutdown token - marks shutdown and signals all in-flight operations
+        self.shutdown_token.cancel();
+
+        // Collect all active boxes
+        let active_boxes: Vec<SharedBoxImpl> = {
+            let sync = self.sync_state.read().unwrap();
+            sync.active_boxes_by_id
+                .values()
+                .filter_map(|weak| weak.upgrade())
+                .collect()
+        };
+
+        if active_boxes.is_empty() {
+            tracing::info!("No active boxes to shutdown");
+            return Ok(());
+        }
+
+        tracing::info!(count = active_boxes.len(), "Stopping active boxes");
+
+        // Convert timeout to duration
+        let timeout_duration = timeout_to_duration(timeout);
+
+        // Stop all boxes concurrently
+        let stop_futures = active_boxes.iter().map(|box_impl| {
+            let box_id = box_impl.id().to_string();
+            async move {
+                let result = if let Some(duration) = timeout_duration {
+                    tokio::time::timeout(duration, box_impl.stop()).await
+                } else {
+                    // Infinite timeout
+                    Ok(box_impl.stop().await)
+                };
+                (box_id, result)
+            }
+        });
+
+        let results = futures::future::join_all(stop_futures).await;
+
+        // Check for errors
+        let mut errors = Vec::new();
+        for (box_id, result) in results {
+            match result {
+                Ok(Ok(())) => {
+                    tracing::debug!(box_id = %box_id, "Box stopped gracefully");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(box_id = %box_id, error = %e, "Box stop failed");
+                    errors.push(format!("{}: {}", box_id, e));
+                }
+                Err(_) => {
+                    tracing::warn!(box_id = %box_id, "Box stop timed out");
+                    errors.push(format!("{}: timeout", box_id));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            tracing::info!("Runtime shutdown complete");
+            Ok(())
+        } else {
+            Err(BoxliteError::Internal(format!(
+                "Shutdown completed with errors: {}",
+                errors.join(", ")
+            )))
+        }
     }
 
     // ========================================================================
@@ -960,7 +1130,9 @@ impl RuntimeImpl {
         }
 
         // Create new BoxImpl and cache in both maps
-        let box_impl = Arc::new(BoxImpl::new(config, state, Arc::clone(self)));
+        // Pass a child token so box can be cancelled independently or via runtime shutdown
+        let box_token = self.shutdown_token.child_token();
+        let box_impl = Arc::new(BoxImpl::new(config, state, Arc::clone(self), box_token));
         let weak = Arc::downgrade(&box_impl);
 
         sync.active_boxes_by_id.insert(box_id.clone(), weak.clone());

@@ -32,6 +32,7 @@ help:
 	@echo "    make test:python    - Run Python SDK unit tests"
 	@echo "    make test:node      - Run Node.js SDK unit tests"
 	@echo "    make test:cli       - Run CLI integration tests (prepares runtime first)"
+	@echo "    make test:integration - Run Rust integration tests (requires VM environment)"
 	@echo ""
 	@echo "  Local Development:"
 	@echo "    make dev:python     - Build and install Python SDK locally (debug mode)"
@@ -124,9 +125,9 @@ dist\:c: runtime
 		exit 1; \
 	fi
 
-# Build Node.js distribution packages
+# Build Node.js distribution packages (local use)
 dist\:node: runtime
-	@bash $(SCRIPT_DIR)/build/build-node-sdk.sh --profile release
+	@cd sdks/node && npm install --silent && npm run build:native -- --release && npm run build && npm run artifacts && npm run bundle:runtime && npm run pack:all
 
 
 # Build wheel locally with maturin + platform-specific repair tool
@@ -159,7 +160,11 @@ dev\:c: runtime
 
 # Build Node.js SDK locally with napi-rs (debug mode)
 dev\:node: runtime-debug
-	@bash $(SCRIPT_DIR)/build/build-node-sdk.sh --profile debug
+	@cd sdks/node && npm install --silent && npm run build:native && npm run build
+	@ln -sfn ../../../target/boxlite-runtime sdks/node/native/runtime
+	@echo "📦 Linking SDK to examples..."
+	@cd examples/node && npm install --silent
+	@echo "✅ Node.js SDK built and linked to examples"
 
 # Run all unit tests (excludes integration tests that require VMs)
 test:
@@ -188,6 +193,12 @@ test\:node:
 test\:cli: runtime-debug
 	@echo "🧪 Running CLI integration tests..."
 	@cargo test -p boxlite-cli --tests --no-fail-fast -- --test-threads=1
+
+# Run Rust integration tests (requires VM environment)
+test\:integration: runtime-debug
+	@echo "🧪 Running Rust integration tests (requires VM)..."
+	@BOXLITE_RUNTIME_DIR=$(PROJECT_ROOT)/target/boxlite-runtime \
+		cargo test -p boxlite --test '*' --no-fail-fast -- --test-threads=1 --nocapture
 
 # Format all Rust code
 fmt:

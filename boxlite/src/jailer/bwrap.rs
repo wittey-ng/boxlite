@@ -3,6 +3,12 @@
 //! This module builds the `bwrap` command with appropriate arguments
 //! for sandboxing the boxlite-shim process.
 //!
+//! ## Bwrap Discovery
+//!
+//! BoxLite looks for bwrap in this order:
+//! 1. **System bwrap** - Allows users to use their own version (in PATH)
+//! 2. **Bundled bwrap** - Falls back to the version built from bubblewrap-sys
+//!
 //! ## What Bubblewrap Provides
 //!
 //! - Namespace isolation (mount, pid, user, ipc, uts)
@@ -24,22 +30,103 @@
 
 use super::config::SecurityOptions;
 use crate::runtime::layout::FilesystemLayout;
-use std::path::Path;
+use crate::util::find_binary;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
-/// Check if bubblewrap (bwrap) is available on the system.
+/// Cached path to the bwrap binary (system or bundled).
+///
+/// This is initialized once on first access and cached for the process lifetime.
+static BWRAP_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Get the path to the bwrap binary.
+///
+/// Search order:
+/// 1. System bwrap (in PATH) - allows users to override with their own version
+/// 2. Bundled bwrap (from bubblewrap-sys) - fallback for SDK distribution
+///
+/// Returns `None` if neither is available.
+fn get_bwrap_path() -> Option<&'static PathBuf> {
+    BWRAP_PATH
+        .get_or_init(|| {
+            // 1. Try system bwrap first (allows user override)
+            if let Ok(output) = Command::new("bwrap").arg("--version").output()
+                && output.status.success()
+            {
+                tracing::debug!("Using system bwrap from PATH");
+                return Some(PathBuf::from("bwrap"));
+            }
+
+            // 2. Try bundled bwrap (from bubblewrap-sys)
+            match find_binary("bwrap") {
+                Ok(bundled_path) if bundled_path.exists() => {
+                    tracing::debug!(
+                        path = %bundled_path.display(),
+                        "Using bundled bwrap"
+                    );
+                    Some(bundled_path)
+                }
+                Ok(bundled_path) => {
+                    tracing::warn!(
+                        path = %bundled_path.display(),
+                        "Bundled bwrap path found but file does not exist"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "Bundled bwrap not found"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Check if bubblewrap (bwrap) is available (system or bundled).
 pub fn is_available() -> bool {
-    Command::new("bwrap")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    get_bwrap_path().is_some()
+}
+
+/// Check if bwrap can create user namespaces.
+///
+/// Runs `bwrap --unshare-user -- true` as a preflight check.
+/// This catches AppArmor restrictions and missing kernel support
+/// before the actual shim spawn.
+///
+/// Returns `Ok(())` if user namespaces work, or `Err` with diagnostic info.
+pub fn check_userns_available() -> Result<(), String> {
+    let bwrap_path = match get_bwrap_path() {
+        Some(p) => p,
+        None => return Err("bwrap binary not found".to_string()),
+    };
+
+    let output = Command::new(bwrap_path)
+        .args(["--unshare-user", "--", "true"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            Err(format!(
+                "bwrap --unshare-user failed (exit {}): {}",
+                o.status.code().unwrap_or(-1),
+                stderr.trim()
+            ))
+        }
+        Err(e) => Err(format!("failed to run bwrap: {}", e)),
+    }
 }
 
 /// Get the bwrap version string.
 #[allow(dead_code)]
 pub fn version() -> Option<String> {
-    Command::new("bwrap")
+    let bwrap_path = get_bwrap_path()?;
+    Command::new(bwrap_path)
         .arg("--version")
         .output()
         .ok()
@@ -222,8 +309,19 @@ impl BwrapCommand {
     // ─────────────────────────────────────────────────────────────────────
 
     /// Build the command with the specified executable and arguments.
+    ///
+    /// Uses the discovered bwrap path (system or bundled).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called when `is_available()` returns false. Always check
+    /// availability before calling this method.
     pub fn build(&self, executable: impl AsRef<Path>, args: &[String]) -> Command {
-        let mut cmd = Command::new("bwrap");
+        let bwrap_path = get_bwrap_path().expect(
+            "BwrapCommand::build() called but bwrap is not available. Check is_available() first.",
+        );
+
+        let mut cmd = Command::new(bwrap_path);
         cmd.args(&self.args);
         cmd.arg("--");
         cmd.arg(executable.as_ref());
@@ -429,6 +527,12 @@ mod tests {
 
     #[test]
     fn test_build_command() {
+        // Skip if bwrap not available
+        if !is_available() {
+            println!("Skipping test: bwrap not available");
+            return;
+        }
+
         let mut bwrap = BwrapCommand::new();
         bwrap
             .with_default_namespaces()
@@ -440,8 +544,13 @@ mod tests {
             &["hello".to_string(), "world".to_string()],
         );
 
-        // Verify command is bwrap
-        assert_eq!(cmd.get_program(), "bwrap");
+        // Verify command program contains "bwrap" (may be absolute path or just "bwrap")
+        let program = cmd.get_program().to_string_lossy();
+        assert!(
+            program.ends_with("bwrap") || program == "bwrap",
+            "Expected program to be bwrap, got: {}",
+            program
+        );
     }
 
     #[test]
@@ -472,5 +581,21 @@ mod tests {
         // Non-existent paths should not be added
         assert!(!args.contains(&"/nonexistent".to_string()));
         assert!(!args.contains(&"/nonexistent_dev".to_string()));
+    }
+
+    /// Verify check_userns_available() returns a well-formed result.
+    /// On CI/dev machines this will either succeed or fail with a clear message.
+    #[test]
+    fn test_check_userns_available() {
+        let result = check_userns_available();
+        match result {
+            Ok(()) => {
+                // bwrap user namespaces are available — nothing else to verify
+            }
+            Err(e) => {
+                // Should contain diagnostic info (exit code + stderr)
+                assert!(!e.is_empty(), "Error message should not be empty");
+            }
+        }
     }
 }

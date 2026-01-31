@@ -18,8 +18,11 @@ use crate::images::manager::{ImageManifest, LayerInfo};
 use crate::images::storage::ImageStorage;
 use boxlite_shared::{BoxliteError, BoxliteResult};
 use oci_client::Reference;
-use oci_client::manifest::OciDescriptor;
+use oci_client::manifest::{
+    ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest as ClientOciImageManifest,
+};
 use oci_client::secrets::RegistryAuth;
+use oci_spec::image::MediaType;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -34,12 +37,13 @@ use tokio::sync::RwLock;
 /// by `ImageStore` which provides thread-safe access.
 struct ImageStoreInner {
     index: ImageIndexStore,
-    storage: ImageStorage,
+    /// Storage is Arc-wrapped so it can be shared with BlobSource
+    storage: Arc<ImageStorage>,
 }
 
 impl ImageStoreInner {
     fn new(images_dir: PathBuf, db: Database) -> BoxliteResult<Self> {
-        let storage = ImageStorage::new(images_dir)?;
+        let storage = Arc::new(ImageStorage::new(images_dir)?);
         let index = ImageIndexStore::new(db);
         Ok(Self { index, storage })
     }
@@ -57,8 +61,7 @@ impl ImageStoreInner {
 /// # Thread Safety
 ///
 /// - `pull()`: Releases lock during network I/O for better concurrency
-/// - `config()`, `layer_tarball()`: Quick read operations
-/// - `layer_extracted()`: May do I/O but uses atomic file operations
+/// - `storage()`: Returns shared storage for creating `BlobSource`
 ///
 /// # Example
 ///
@@ -68,9 +71,9 @@ impl ImageStoreInner {
 /// // Pull image (thread-safe, releases lock during download)
 /// let manifest = store.pull("python:alpine").await?;
 ///
-/// // Access layer data
-/// let tarball = store.layer_tarball(&manifest.layers[0].digest);
-/// let extracted = store.layer_extracted(&manifest.layers[0].digest)?;
+/// // Create BlobSource for accessing layers
+/// let storage = store.storage().await;
+/// let blob_source = BlobSource::Store(StoreBlobSource::new(storage));
 /// ```
 pub struct ImageStore {
     /// OCI registry client (immutable, outside lock)
@@ -102,6 +105,29 @@ impl ImageStore {
             inner: RwLock::new(inner),
             registries,
         })
+    }
+
+    /// Get shared reference to image storage for BlobSource creation.
+    ///
+    /// This allows creating `StoreBlobSource` that can outlive the lock.
+    pub async fn storage(&self) -> Arc<ImageStorage> {
+        Arc::clone(&self.inner.read().await.storage)
+    }
+
+    /// Compute cache directory for a local OCI bundle.
+    ///
+    /// Returns an isolated cache path based on bundle path and manifest digest.
+    /// This ensures cache invalidation when bundle content changes.
+    pub async fn local_bundle_cache_dir(
+        &self,
+        bundle_path: &std::path::Path,
+        manifest_digest: &str,
+    ) -> PathBuf {
+        self.inner
+            .read()
+            .await
+            .storage
+            .local_bundle_cache_dir(bundle_path, manifest_digest)
     }
 
     // ========================================================================
@@ -196,148 +222,190 @@ impl ImageStore {
         }
     }
 
-    /// Load config JSON for an image.
+    /// List all cached images.
     ///
-    /// Returns the raw JSON string. Use `serde_json::from_str()` to parse.
-    pub async fn config(&self, config_digest: &str) -> BoxliteResult<String> {
+    /// Returns a vector of (reference, CachedImage) tuples ordered by cache time (Newest first).
+    pub async fn list(&self) -> BoxliteResult<Vec<(String, CachedImage)>> {
         let inner = self.inner.read().await;
-        inner.storage.load_config(config_digest)
+        inner.index.list_all()
     }
 
-    /// Get path to layer tarball.
+    /// Load an OCI image from a local directory.
     ///
-    /// Returns the path where the layer tarball is stored. The layer must
-    /// have been downloaded via `pull()` first.
-    pub async fn layer_tarball(&self, digest: &str) -> PathBuf {
-        let inner = self.inner.read().await;
-        inner.storage.layer_tarball_path(digest)
-    }
-
-    /// Get paths to extracted layer directories.
+    /// Reads OCI layout files (index.json, manifest blob) using oci-spec types
+    /// and returns an `ImageManifest`. Layers and configs are imported into the
+    /// image store using hard links.
     ///
-    /// Extracts layers if not already cached. Uses rayon for parallel extraction
-    /// and atomic file operations so concurrent calls are safe.
+    /// Expected structure:
+    ///   ```text
+    ///   {path}/
+    ///     oci-layout       - OCI layout specification file
+    ///     index.json       - OCI image index (references manifests)
+    ///     blobs/sha256/    - Content-addressed blobs
+    ///       {manifest_digest}
+    ///       {config_digest}
+    ///       {layer_digest_1}
+    ///       {layer_digest_2}
+    ///       ...
+    ///   ```
     ///
     /// # Arguments
-    /// * `digests` - Layer digests to extract (ordered bottom to top)
+    /// * `path` - Path to local image directory
     ///
     /// # Returns
-    /// Vector of paths to extracted layer directories (same order as input)
-    pub async fn layer_extracted(&self, digests: Vec<String>) -> BoxliteResult<Vec<PathBuf>> {
-        use rayon::prelude::*;
-
-        // Get all paths with read lock
-        let layer_info: Vec<(String, PathBuf, PathBuf)> = {
-            let inner = self.inner.read().await;
-            digests
-                .iter()
-                .map(|digest| {
-                    (
-                        digest.clone(),
-                        inner.storage.layer_tarball_path(digest),
-                        inner.storage.layer_extracted_path(digest),
-                    )
-                })
-                .collect()
-        }; // Lock released
-
-        // Extract layers in parallel using rayon (sync operations)
-        // extract_layer uses atomic file operations so concurrent calls are safe
-        let inner = self.inner.read().await;
-        layer_info
-            .into_par_iter()
-            .map(|(digest, tarball_path, extracted_path)| {
-                // Check if already extracted
-                if extracted_path.exists() {
-                    tracing::debug!("Using cached extracted layer: {}", digest);
-                    return Ok(extracted_path);
-                }
-
-                // Extract layer (atomic - safe for concurrent access)
-                tracing::debug!("Extracting layer: {}", digest);
-                inner
-                    .storage
-                    .extract_layer(digest.as_str(), &tarball_path)?;
-                Ok(extracted_path)
-            })
-            .collect()
-    }
-
-    /// Get existing disk image for an image digest if available.
+    /// `ImageManifest` with layer digests and config digest
     ///
-    /// Returns a persistent Disk if the cached disk image exists, None otherwise.
-    /// The returned Disk is persistent (won't be deleted on drop).
-    pub async fn disk_image(&self, image_digest: &str) -> Option<crate::disk::Disk> {
-        let inner = self.inner.read().await;
-        if let Some((path, format)) = inner.storage.find_disk_image(image_digest) {
-            Some(crate::disk::Disk::new(path, format, true))
-        } else {
-            None
-        }
-    }
+    /// # Errors
+    /// - If `path/index.json` or `path/oci-layout` doesn't exist
+    /// - If any referenced blob is missing
+    /// - If hard linking fails
+    pub async fn load_from_local(&self, path: std::path::PathBuf) -> BoxliteResult<ImageManifest> {
+        tracing::info!("Loading OCI image from local path: {}", path.display());
 
-    /// Install a disk as the cached disk image for an image digest.
-    ///
-    /// Atomically moves the source disk to the image store path.
-    /// The source disk is consumed and a new persistent Disk is returned.
-    /// The target path extension is determined by the disk's format.
-    ///
-    /// # Arguments
-    /// * `image_digest` - Stable digest identifying the image
-    /// * `disk` - Source disk to install (will be moved, not copied)
-    ///
-    /// # Returns
-    /// New persistent Disk at the installed location
-    pub async fn install_disk_image(
-        &self,
-        image_digest: &str,
-        disk: crate::disk::Disk,
-    ) -> BoxliteResult<crate::disk::Disk> {
-        let inner = self.inner.read().await;
-        let disk_format = disk.format();
-        let target_path = inner.storage.disk_image_path(image_digest, disk_format);
-
-        // Ensure parent directory exists
-        if let Some(parent) = target_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                BoxliteError::Storage(format!(
-                    "Failed to create disk image directory {}: {}",
-                    parent.display(),
-                    e
-                ))
-            })?;
+        // 1. Validate OCI layout
+        let oci_layout_path = path.join("oci-layout");
+        if !oci_layout_path.exists() {
+            return Err(BoxliteError::Storage(format!(
+                "Local image must contain oci-layout file, not found at: {}",
+                oci_layout_path.display()
+            )));
         }
 
-        // If target already exists, just return it (idempotent)
-        if target_path.exists() {
-            tracing::debug!("Disk image already installed: {}", target_path.display());
-            // Leak the source disk to prevent cleanup (it may have been the same file)
-            let _ = disk.leak();
-            return Ok(crate::disk::Disk::new(target_path, disk_format, true));
-        }
+        // 2. Load and parse index.json using oci_client types
+        let index_path = path.join("index.json");
+        let index_json = std::fs::read_to_string(&index_path)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to read index.json: {}", e)))?;
 
-        let source_path = disk.path().to_path_buf();
+        let index: OciImageIndex = serde_json::from_str(&index_json)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to parse index.json: {}", e)))?;
 
-        // Atomic rename (move) - works if on same filesystem
-        std::fs::rename(&source_path, &target_path).map_err(|e| {
-            BoxliteError::Storage(format!(
-                "Failed to install disk image from {} to {}: {}",
-                source_path.display(),
-                target_path.display(),
-                e
-            ))
-        })?;
+        // 3. Get first manifest descriptor
+        let manifest_desc = index
+            .manifests
+            .first()
+            .ok_or_else(|| BoxliteError::Storage("No manifests found in index.json".into()))?;
 
-        // Leak the source disk to prevent Drop from trying to delete the old path
-        let _ = disk.leak();
+        // 4. Resolve to ImageManifest (handles at most one level of ImageIndex)
+        let manifest_digest = self.get_image_manifest(&path, manifest_desc)?;
+
+        // 5. Parse ImageManifest to extract config and layers
+        let manifest_blob_path = path.join("blobs").join(manifest_digest.replace(':', "/"));
+
+        let (config_digest_str, layers) = self.parse_oci_manifest_from_path(
+            &manifest_blob_path,
+            &format!("image manifest {}", manifest_digest),
+        )?;
+
+        // Note: Blobs are NOT imported to storage. LocalBundleBlobSource reads
+        // directly from the bundle path, avoiding duplication.
 
         tracing::info!(
-            "Installed disk image: {} -> {}",
-            source_path.display(),
-            target_path.display()
+            "Loaded local OCI image: config={}, {} layers, manifest={}",
+            config_digest_str,
+            layers.len(),
+            manifest_digest
         );
 
-        Ok(crate::disk::Disk::new(target_path, disk_format, true))
+        Ok(ImageManifest {
+            manifest_digest: manifest_digest.to_string(),
+            layers,
+            config_digest: config_digest_str,
+        })
+    }
+
+    /// Get an ImageManifest digest from the descriptor.
+    ///
+    /// Handles at most two levels (like containerd):
+    /// - index.json → ImageManifest (single platform)
+    /// - index.json → ImageIndex → ImageManifest (multi-platform)
+    ///
+    /// Note: While the OCI image index specification theoretically supports
+    /// arbitrary nesting, common implementations like containerd only support
+    /// at most one level of indirection.
+    ///
+    /// # Arguments
+    /// * `image_dir` - Base directory containing blobs/
+    /// * `descriptor` - Starting descriptor (may point to ImageIndex or ImageManifest)
+    ///
+    /// # Returns
+    /// The digest of the ImageManifest
+    fn get_image_manifest(
+        &self,
+        image_dir: &std::path::Path,
+        descriptor: &ImageIndexEntry,
+    ) -> BoxliteResult<String> {
+        // Check media type using string matching
+        let media_type = MediaType::from(descriptor.media_type.as_str());
+
+        match media_type {
+            MediaType::ImageIndex => {
+                tracing::info!("ImageIndex detected, selecting platform-specific manifest");
+
+                // Load the ImageIndex blob
+                let index_blob_path = image_dir
+                    .join("blobs")
+                    .join(descriptor.digest.replace(':', "/"));
+
+                if !index_blob_path.exists() {
+                    return Err(BoxliteError::Storage(format!(
+                        "ImageIndex blob not found: {}",
+                        index_blob_path.display()
+                    )));
+                }
+
+                let index_json = std::fs::read_to_string(&index_blob_path).map_err(|e| {
+                    BoxliteError::Storage(format!("Failed to read ImageIndex blob: {}", e))
+                })?;
+
+                let child_index: OciImageIndex =
+                    serde_json::from_str(&index_json).map_err(|e| {
+                        BoxliteError::Storage(format!("Failed to parse ImageIndex: {}", e))
+                    })?;
+
+                // Detect platform
+                let (platform_os, platform_arch) = Self::detect_platform();
+
+                tracing::debug!(
+                    "Selecting platform manifest: {}/{} (Rust arch: {})",
+                    platform_os,
+                    platform_arch,
+                    std::env::consts::ARCH
+                );
+
+                // Select platform-specific manifest descriptor using unified function
+                let platform_manifest =
+                    self.select_platform_manifest(&child_index, platform_os, platform_arch)?;
+
+                tracing::info!(
+                    "Selected platform-specific manifest: {}",
+                    platform_manifest.digest
+                );
+
+                // Verify the selected manifest is an ImageManifest (not another ImageIndex)
+                let platform_mt = MediaType::from(platform_manifest.media_type.as_str());
+                match platform_mt {
+                    MediaType::ImageIndex => Err(BoxliteError::Storage(format!(
+                        "Nested ImageIndex not supported (platform manifest {} is an ImageIndex, not ImageManifest)",
+                        platform_manifest.digest
+                    ))),
+                    _ => {
+                        tracing::debug!("Platform manifest is ImageManifest");
+                        Ok(platform_manifest.digest.clone())
+                    }
+                }
+            }
+            MediaType::ImageManifest => {
+                tracing::debug!(
+                    "ImageManifest found, returning digest: {}",
+                    descriptor.digest
+                );
+                Ok(descriptor.digest.clone())
+            }
+            _ => Err(BoxliteError::Storage(format!(
+                "Unsupported media type: {}. Expected ImageManifest or ImageIndex",
+                media_type
+            ))),
+        }
     }
 
     // ========================================================================
@@ -818,6 +886,42 @@ impl ImageStore {
 
         Ok(())
     }
+
+    /// Parse OCI image manifest from file path.
+    ///
+    /// Reads an OCI ImageManifest from the given path and extracts
+    /// config digest and layer information.
+    ///
+    /// # Arguments
+    /// * `manifest_path` - Path to the manifest JSON file
+    /// * `context` - Description for error messages (e.g., "platform manifest", "image manifest")
+    ///
+    /// # Returns
+    /// Tuple of (config_digest_string, layers_vector)
+    fn parse_oci_manifest_from_path(
+        &self,
+        manifest_path: &std::path::Path,
+        context: &str,
+    ) -> BoxliteResult<(String, Vec<LayerInfo>)> {
+        let manifest_json = std::fs::read_to_string(manifest_path)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to read manifest file: {}", e)))?;
+
+        let oci_manifest: ClientOciImageManifest = serde_json::from_str(&manifest_json)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to parse {}: {}", context, e)))?;
+
+        let config_digest_str = oci_manifest.config.digest.clone();
+
+        let layers: Vec<LayerInfo> = oci_manifest
+            .layers
+            .iter()
+            .map(|layer| LayerInfo {
+                digest: layer.digest.clone(),
+                media_type: layer.media_type.clone(),
+            })
+            .collect();
+
+        Ok((config_digest_str, layers))
+    }
 }
 
 // ============================================================================
@@ -828,3 +932,236 @@ impl ImageStore {
 ///
 /// Used by `ImageManager` and `ImageObject` to share the same store.
 pub type SharedImageStore = Arc<ImageStore>;
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use std::path::Path;
+
+    /// Helper to create a minimal OCI bundle for testing
+    fn create_test_oci_bundle(bundle_dir: &Path) -> String {
+        use sha2::Digest;
+
+        // Create OCI layout
+        std::fs::create_dir_all(bundle_dir.join("blobs/sha256")).unwrap();
+
+        let oci_layout = r#"{"imageLayoutVersion": "1.0.0"}"#;
+        std::fs::write(bundle_dir.join("oci-layout"), oci_layout).unwrap();
+
+        // Create a minimal layer tarball with a single file
+        let layer_content = create_minimal_tarball();
+        let layer_digest = format!(
+            "sha256:{}",
+            sha2::Sha256::digest(&layer_content)
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
+        let layer_path = bundle_dir.join("blobs/sha256").join(&layer_digest[7..]);
+        std::fs::write(&layer_path, &layer_content).unwrap();
+
+        // Create config
+        let config = r#"{
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {
+                "Env": ["PATH=/usr/local/bin:/usr/bin:/bin"],
+                "WorkingDir": "/"
+            },
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": []
+            }
+        }"#;
+        let config_bytes = config.as_bytes();
+        let config_digest = format!(
+            "sha256:{}",
+            sha2::Sha256::digest(config_bytes)
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
+        let config_path = bundle_dir.join("blobs/sha256").join(&config_digest[7..]);
+        std::fs::write(&config_path, config_bytes).unwrap();
+
+        // Create manifest
+        let manifest = format!(
+            r#"{{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {{
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": "{}",
+                "size": {}
+            }},
+            "layers": [
+                {{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": "{}",
+                    "size": {}
+                }}
+            ]
+        }}"#,
+            config_digest,
+            config_bytes.len(),
+            layer_digest,
+            layer_content.len()
+        );
+        let manifest_bytes = manifest.as_bytes();
+        let manifest_digest = format!(
+            "sha256:{}",
+            sha2::Sha256::digest(manifest_bytes)
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
+        let manifest_path = bundle_dir.join("blobs/sha256").join(&manifest_digest[7..]);
+        std::fs::write(&manifest_path, manifest_bytes).unwrap();
+
+        // Create index.json
+        let index = format!(
+            r#"{{
+            "schemaVersion": 2,
+            "manifests": [
+                {{
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "{}",
+                    "size": {}
+                }}
+            ]
+        }}"#,
+            manifest_digest,
+            manifest_bytes.len()
+        );
+        std::fs::write(bundle_dir.join("index.json"), index).unwrap();
+
+        layer_digest
+    }
+
+    /// Create a minimal tar archive with a single file
+    fn create_minimal_tarball() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Add a simple file
+        let content = b"Hello from test layer!";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("test.txt").unwrap();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, &content[..]).unwrap();
+
+        builder.into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_load_from_local_basic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bundle_dir = temp_dir.path().join("bundle");
+        let images_dir = temp_dir.path().join("images");
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create test bundle
+        let layer_digest = create_test_oci_bundle(&bundle_dir);
+
+        // Create store
+        let db = Database::open(&db_path).unwrap();
+        let store = ImageStore::new(images_dir.clone(), db, vec![]).unwrap();
+
+        // Load from local
+        let manifest = store.load_from_local(bundle_dir.clone()).await.unwrap();
+
+        // Verify manifest
+        assert_eq!(manifest.layers.len(), 1);
+        assert_eq!(manifest.layers[0].digest, layer_digest);
+        assert!(!manifest.config_digest.is_empty());
+        assert!(!manifest.manifest_digest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_from_local_no_blob_import() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bundle_dir = temp_dir.path().join("bundle");
+        let images_dir = temp_dir.path().join("images");
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create test bundle
+        let layer_digest = create_test_oci_bundle(&bundle_dir);
+
+        // Create store
+        let db = Database::open(&db_path).unwrap();
+        let store = ImageStore::new(images_dir.clone(), db, vec![]).unwrap();
+
+        // Load from local
+        let _manifest = store.load_from_local(bundle_dir.clone()).await.unwrap();
+
+        // Verify blobs were NOT imported to storage
+        // (This is the key behavior change - LocalBundleBlobSource reads from bundle)
+        let layer_path = images_dir
+            .join("layers")
+            .join(format!("{}.tar.gz", layer_digest.replace(':', "-")));
+        assert!(
+            !layer_path.exists(),
+            "Layer should NOT be imported to storage"
+        );
+
+        // The original bundle should still have the layer
+        let bundle_layer_path = bundle_dir
+            .join("blobs")
+            .join(layer_digest.replace(':', "/"));
+        assert!(bundle_layer_path.exists(), "Bundle should still have layer");
+    }
+
+    #[tokio::test]
+    async fn test_load_from_local_missing_oci_layout() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bundle_dir = temp_dir.path().join("bundle");
+        let images_dir = temp_dir.path().join("images");
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create incomplete bundle (missing oci-layout)
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("index.json"), "{}").unwrap();
+
+        // Create store
+        let db = Database::open(&db_path).unwrap();
+        let store = ImageStore::new(images_dir.clone(), db, vec![]).unwrap();
+
+        // Load should fail
+        let result = store.load_from_local(bundle_dir).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("oci-layout"));
+    }
+
+    #[tokio::test]
+    async fn test_load_from_local_missing_index() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bundle_dir = temp_dir.path().join("bundle");
+        let images_dir = temp_dir.path().join("images");
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create incomplete bundle (missing index.json)
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(
+            bundle_dir.join("oci-layout"),
+            r#"{"imageLayoutVersion": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        // Create store
+        let db = Database::open(&db_path).unwrap();
+        let store = ImageStore::new(images_dir.clone(), db, vec![]).unwrap();
+
+        // Load should fail
+        let result = store.load_from_local(bundle_dir).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("index.json"));
+    }
+}

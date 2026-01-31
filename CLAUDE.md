@@ -58,6 +58,7 @@ scripts/              # Build and setup scripts
 - `runtime/` - BoxliteRuntime, main entry point
 - `litebox/` - LiteBox handle, command execution
 - `vmm/` - VM manager (libkrun, shim controller)
+- `jailer/` - Security isolation (seccomp, sandbox-exec, namespaces)
 - `portal/` - Host-guest gRPC communication
 - `images/` - OCI image management
 - `net/`, `volumes/`, `disk/` - Networking, storage, disks
@@ -90,12 +91,17 @@ make dist:python    # Build portable Python wheel
 
 ## Code Style
 
-**Rust:**
-- `cargo fmt` for formatting (enforced in CI)
-- `cargo clippy` for linting
+**Rust:** Follow [docs/development/rust-style.md](./docs/development/rust-style.md) which includes:
+- [Microsoft Rust Guidelines](https://microsoft.github.io/rust-guidelines) - external reference
+- `cargo fmt` for formatting, `cargo clippy` for linting (enforced in CI)
 - Async-first (Tokio runtime)
 - Error handling via centralized `BoxliteError` enum
 - `Send + Sync` for public types
+
+Key guidelines to internalize:
+- **M-PANIC-IS-STOP**: Panics terminate, don't use for error handling
+- **M-CONCISE-NAMES**: Avoid "Service", "Manager", "Factory" in type names
+- **M-UNSAFE**: Minimize and document all unsafe blocks
 
 **Python:**
 - Async/await for all I/O
@@ -103,7 +109,7 @@ make dist:python    # Build portable Python wheel
 - Type hints encouraged
 
 **For complete code style guidelines, see:**
-- [CONTRIBUTING.md](./CONTRIBUTING.md#code-style) - Detailed style guidelines
+- [docs/development/rust-style.md](./docs/development/rust-style.md) - Rust style guide with Microsoft guidelines
 - [boxlite-shared/src/errors.rs](./boxlite-shared/src/errors.rs) - Error handling patterns
 
 ## Workflows
@@ -138,6 +144,7 @@ make dist:python    # Build portable Python wheel
 
 **Architecture quirks:**
 - **Shim process**: boxlite-shim isolates boxes (libkrun does process takeover)
+- **Jailer**: OS-level sandbox (seccomp/sandbox-exec) wraps shim for defense-in-depth
 - **gRPC communication**: Host-guest communication via vsock (not TCP)
 - **~/.boxlite directory**: All runtime data stored here (images, boxes, db)
 

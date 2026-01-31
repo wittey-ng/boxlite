@@ -18,6 +18,9 @@ const ERR_STDERR_UNAVAILABLE: &str = "stderr stream not available";
 pub struct JsExecResult {
     /// Process exit code (0 = success, non-zero = error)
     pub exit_code: i32,
+    /// Diagnostic error message when process died unexpectedly.
+    /// Undefined if the process exited normally.
+    pub error_message: Option<String>,
 }
 
 /// Stdout stream for reading command output.
@@ -120,6 +123,25 @@ impl JsExecStdin {
     #[napi]
     pub async fn write_string(&self, text: String) -> Result<()> {
         self.write(text.into_bytes().into()).await
+    }
+
+    /// Close stdin stream, signaling EOF to the process.
+    ///
+    /// After closing, the process will receive EOF on its stdin.
+    /// This is necessary for commands like `tar xf -` that read
+    /// until EOF before processing.
+    ///
+    /// # Example
+    /// ```javascript
+    /// const stdin = await execution.stdin();
+    /// await stdin.write(Buffer.from(data));
+    /// await stdin.close();
+    /// ```
+    #[napi]
+    pub async fn close(&self) -> Result<()> {
+        let mut guard = self.stream.lock().await;
+        guard.close();
+        Ok(())
     }
 }
 
@@ -235,6 +257,7 @@ impl JsExecution {
         let exec_result = guard.wait().await.map_err(map_err)?;
         Ok(JsExecResult {
             exit_code: exec_result.exit_code,
+            error_message: exec_result.error_message,
         })
     }
 

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, List, Optional
 from greenlet import greenlet
 
 if TYPE_CHECKING:
+    from ._box import SyncBox
     from ..boxlite import Boxlite, BoxOptions, BoxInfo, RuntimeMetrics, Options
 
 __all__ = ["SyncBoxlite"]
@@ -59,6 +60,7 @@ class SyncBoxlite:
                      Use SyncBoxlite.default() for default runtime.
         """
         from ..boxlite import Boxlite
+
         self._boxlite = Boxlite(options)
 
         self._loop: asyncio.AbstractEventLoop = None
@@ -105,6 +107,7 @@ class SyncBoxlite:
         self._dispatcher_fiber = greenlet(greenlet_main)
 
         from ._sync_base import SyncBase
+
         self._sync_helper = SyncBase(self._boxlite, self._loop, self._dispatcher_fiber)
 
         # 5. Start dispatcher fiber
@@ -197,6 +200,7 @@ class SyncBoxlite:
                 ...
         """
         from ..boxlite import Boxlite
+
         Boxlite.init_default(options)
 
     @staticmethod
@@ -218,6 +222,7 @@ class SyncBoxlite:
         instance = object.__new__(SyncBoxlite)
 
         from ..boxlite import Boxlite
+
         instance._boxlite = Boxlite.default()
 
         instance._loop = None
@@ -246,9 +251,9 @@ class SyncBoxlite:
     # ─────────────────────────────────────────────────────────────────────────
 
     def create(
-            self,
-            options: "BoxOptions",
-            name: Optional[str] = None,
+        self,
+        options: "BoxOptions",
+        name: Optional[str] = None,
     ) -> "SyncBox":
         """
         Create a new box.
@@ -269,6 +274,29 @@ class SyncBoxlite:
 
         native_box = self._sync(self._boxlite.create(options, name=name))
         return SyncBox(self, native_box)
+
+    def get_or_create(
+        self,
+        options: "BoxOptions",
+        name: Optional[str] = None,
+    ) -> tuple["SyncBox", bool]:
+        """
+        Get an existing box by name, or create a new one.
+
+        Args:
+            options: BoxOptions specifying image, resources, etc.
+            name: Optional name to look up or assign. If None, always creates.
+
+        Returns:
+            Tuple of (SyncBox, created) where created is True if newly created.
+        """
+        self._require_started()
+        from ._box import SyncBox
+
+        native_box, created = self._sync(
+            self._boxlite.get_or_create(options, name=name)
+        )
+        return SyncBox(self, native_box), created
 
     def get(self, id_or_name: str) -> Optional["SyncBox"]:
         """
@@ -330,6 +358,24 @@ class SyncBoxlite:
             force: Force removal even if box is running.
         """
         self._sync(self._boxlite.remove(id_or_name, force))
+
+    def shutdown(self, timeout: Optional[int] = None) -> None:
+        """
+        Gracefully shutdown all boxes in this runtime.
+
+        This method stops all running boxes, waiting up to `timeout` seconds
+        for each box to stop gracefully before force-killing it.
+
+        After calling this method, the runtime is permanently shut down and
+        will return errors for any new operations (like `create()`).
+
+        Args:
+            timeout: Seconds to wait before force-killing each box:
+                - None (default) - Use default timeout (10 seconds)
+                - Positive integer - Wait that many seconds
+                - -1 - Wait indefinitely (no timeout)
+        """
+        self._sync(self._boxlite.shutdown(timeout))
 
     # ─────────────────────────────────────────────────────────────────────────
     # Properties for internal use by SyncBox/SyncExecution

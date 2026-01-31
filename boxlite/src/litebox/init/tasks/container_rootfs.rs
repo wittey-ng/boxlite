@@ -25,7 +25,17 @@ impl PipelineTask<InitCtx> for ContainerRootfsTask {
         let task_name = self.name();
         let box_id = task_start(&ctx, task_name).await;
 
-        let (rootfs_spec, env, runtime, layout, reuse_rootfs, disk_size_gb) = {
+        let (
+            rootfs_spec,
+            env,
+            runtime,
+            layout,
+            reuse_rootfs,
+            disk_size_gb,
+            entrypoint_override,
+            cmd_override,
+            user_override,
+        ) = {
             let ctx = ctx.lock().await;
             let layout = ctx
                 .layout
@@ -38,6 +48,9 @@ impl PipelineTask<InitCtx> for ContainerRootfsTask {
                 layout,
                 ctx.reuse_rootfs,
                 ctx.config.options.disk_size_gb,
+                ctx.config.options.entrypoint.clone(),
+                ctx.config.options.cmd.clone(),
+                ctx.config.options.user.clone(),
             )
         };
 
@@ -48,6 +61,9 @@ impl PipelineTask<InitCtx> for ContainerRootfsTask {
             &layout,
             reuse_rootfs,
             disk_size_gb,
+            entrypoint_override.as_deref(),
+            cmd_override.as_deref(),
+            user_override.as_deref(),
         )
         .await
         .inspect_err(|e| log_task_error(&box_id, task_name, e))?;
@@ -65,6 +81,7 @@ impl PipelineTask<InitCtx> for ContainerRootfsTask {
 }
 
 /// Pull image and prepare rootfs, then create or reuse COW disk.
+#[allow(clippy::too_many_arguments)]
 async fn run_container_rootfs(
     rootfs_spec: &RootfsSpec,
     env: &[(String, String)],
@@ -72,6 +89,9 @@ async fn run_container_rootfs(
     layout: &BoxFilesystemLayout,
     reuse_rootfs: bool,
     disk_size_gb: Option<u64>,
+    entrypoint_override: Option<&[String]>,
+    cmd_override: Option<&[String]>,
+    user_override: Option<&str>,
 ) -> BoxliteResult<(ContainerImageConfig, Disk)> {
     let disk_path = layout.disk_path();
 
@@ -91,36 +111,61 @@ async fn run_container_rootfs(
 
         let disk = Disk::new(disk_path.clone(), DiskFormat::Qcow2, true);
 
-        let image_ref = match rootfs_spec {
-            RootfsSpec::Image(r) => r,
-            RootfsSpec::RootfsPath(_) => {
-                return Err(BoxliteError::Storage(
-                    "Direct rootfs paths not yet supported".into(),
-                ));
+        // Load container config
+        let image = match rootfs_spec {
+            RootfsSpec::Image(r) => pull_image(runtime, r).await?,
+            RootfsSpec::RootfsPath(path) => {
+                let bundle_dir = std::path::Path::new(path);
+
+                if !bundle_dir.exists() {
+                    return Err(BoxliteError::Storage(format!(
+                        "Rootfs path does not exist: {}",
+                        path
+                    )));
+                }
+
+                runtime
+                    .image_manager
+                    .load_from_local(bundle_dir.to_path_buf(), format!("local:{}", path))
+                    .await?
             }
         };
-        let image = pull_image(runtime, image_ref).await?;
         let image_config = image.load_config().await?;
         let mut container_image_config = ContainerImageConfig::from_oci_config(&image_config)?;
         if !env.is_empty() {
             container_image_config.merge_env(env.to_vec());
         }
+        apply_user_overrides(
+            &mut container_image_config,
+            entrypoint_override,
+            cmd_override,
+            user_override,
+        );
 
         return Ok((container_image_config, disk));
     }
 
-    // Fresh start: pull image and prepare rootfs
-    let image_ref = match rootfs_spec {
-        RootfsSpec::Image(r) => r,
-        RootfsSpec::RootfsPath(_) => {
-            return Err(BoxliteError::Storage(
-                "Direct rootfs paths not yet supported".into(),
-            ));
+    // Fresh start: pull or load image
+    let image = match rootfs_spec {
+        RootfsSpec::Image(r) => pull_image(runtime, r).await?,
+        RootfsSpec::RootfsPath(path) => {
+            let bundle_dir = std::path::Path::new(path);
+
+            if !bundle_dir.exists() {
+                return Err(BoxliteError::Storage(format!(
+                    "Rootfs path does not exist: {}",
+                    path
+                )));
+            }
+
+            runtime
+                .image_manager
+                .load_from_local(bundle_dir.to_path_buf(), format!("local:{}", path))
+                .await?
         }
     };
 
-    let image = pull_image(runtime, image_ref).await?;
-
+    // Prepare rootfs from image
     let rootfs_result = if USE_DISK_ROOTFS {
         prepare_disk_rootfs(runtime, &image).await?
     } else if USE_OVERLAYFS {
@@ -131,14 +176,20 @@ async fn run_container_rootfs(
         ));
     };
 
-    let disk = create_cow_disk(&rootfs_result, layout, disk_size_gb)?;
-
     let image_config = image.load_config().await?;
     let mut container_image_config = ContainerImageConfig::from_oci_config(&image_config)?;
 
     if !env.is_empty() {
         container_image_config.merge_env(env.to_vec());
     }
+    apply_user_overrides(
+        &mut container_image_config,
+        entrypoint_override,
+        cmd_override,
+        user_override,
+    );
+
+    let disk = create_cow_disk(&rootfs_result, layout, disk_size_gb)?;
 
     Ok((container_image_config, disk))
 }
@@ -201,6 +252,24 @@ fn create_cow_disk(
     }
 }
 
+/// Apply user overrides to container image config (entrypoint, CMD, and user).
+fn apply_user_overrides(
+    config: &mut ContainerImageConfig,
+    entrypoint_override: Option<&[String]>,
+    cmd_override: Option<&[String]>,
+    user_override: Option<&str>,
+) {
+    if let Some(ep) = entrypoint_override {
+        config.entrypoint = ep.to_vec();
+    }
+    if let Some(cmd) = cmd_override {
+        config.cmd = cmd.to_vec();
+    }
+    if let Some(user) = user_override {
+        config.user = user.to_string();
+    }
+}
+
 async fn pull_image(
     runtime: &crate::runtime::SharedRuntimeImpl,
     image_ref: &str,
@@ -257,7 +326,7 @@ async fn prepare_disk_rootfs(
     image: &crate::images::ImageObject,
 ) -> BoxliteResult<ContainerRootfsPrepResult> {
     // Check if we already have a cached disk image for this image
-    if let Some(disk) = image.disk_image().await {
+    if let Some(disk) = image.disk_image() {
         let disk_path = disk.path().to_path_buf();
         let disk_size = std::fs::metadata(&disk_path)
             .map(|m| m.len())

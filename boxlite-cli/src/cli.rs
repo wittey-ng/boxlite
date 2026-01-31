@@ -66,6 +66,15 @@ pub enum Commands {
 
     /// Restart one or more boxes
     Restart(crate::commands::restart::RestartArgs),
+
+    /// Pull an image from a registry
+    Pull(crate::commands::pull::PullArgs),
+
+    /// List images
+    Images(crate::commands::images::ImagesArgs),
+
+    /// Copy files/folders between host and box
+    Cp(crate::commands::cp::CpArgs),
 }
 
 // ============================================================================

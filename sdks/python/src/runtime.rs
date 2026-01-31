@@ -108,6 +108,30 @@ impl PyBoxlite {
         })
     }
 
+    /// Get an existing box by name, or create a new one if it doesn't exist.
+    ///
+    /// Returns:
+    ///     Tuple of (Box, bool) where bool is True if newly created, False if existing
+    #[pyo3(signature = (options, name=None))]
+    fn get_or_create<'py>(
+        &self,
+        py: Python<'py>,
+        options: PyBoxOptions,
+        name: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let runtime = Arc::clone(&self.runtime);
+        let opts = options.into();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (handle, created) = runtime.get_or_create(opts, name).await.map_err(map_err)?;
+            Ok((
+                PyBox {
+                    handle: Arc::new(handle),
+                },
+                created,
+            ))
+        })
+    }
+
     fn metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let runtime = Arc::clone(&self.runtime);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -136,6 +160,28 @@ impl PyBoxlite {
 
     fn close(&self) -> PyResult<()> {
         Ok(())
+    }
+
+    /// Gracefully shutdown all boxes in this runtime.
+    ///
+    /// This method stops all running boxes, waiting up to `timeout` seconds
+    /// for each box to stop gracefully before force-killing it.
+    ///
+    /// After calling this method, the runtime is permanently shut down and
+    /// will return errors for any new operations (like `create()`).
+    ///
+    /// Args:
+    ///     timeout: Seconds to wait before force-killing each box:
+    ///         - None (default) - Use default timeout (10 seconds)
+    ///         - Positive integer - Wait that many seconds
+    ///         - -1 - Wait indefinitely (no timeout)
+    #[pyo3(signature = (timeout=None))]
+    fn shutdown<'py>(&self, py: Python<'py>, timeout: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
+        let runtime = Arc::clone(&self.runtime);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            runtime.shutdown(timeout).await.map_err(map_err)?;
+            Ok(())
+        })
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {

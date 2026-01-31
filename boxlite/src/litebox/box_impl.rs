@@ -5,10 +5,12 @@
 // ============================================================================
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use parking_lot::RwLock;
+use tar;
 use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
 
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 
@@ -18,6 +20,7 @@ use super::state::BoxState;
 use crate::disk::Disk;
 #[cfg(target_os = "linux")]
 use crate::fs::BindMountHandle;
+use crate::litebox::copy::CopyOptions;
 use crate::lock::LockGuard;
 use crate::metrics::{BoxMetrics, BoxMetricsStorage};
 use crate::portal::GuestSession;
@@ -94,7 +97,9 @@ pub(crate) struct BoxImpl {
     pub(crate) config: BoxConfig,
     pub(crate) state: RwLock<BoxState>,
     pub(crate) runtime: SharedRuntimeImpl,
-    is_shutdown: AtomicBool,
+    /// Cancellation token for this box (child of runtime's token).
+    /// When cancelled (via stop() or runtime shutdown), all operations abort gracefully.
+    pub(crate) shutdown_token: CancellationToken,
 
     // --- Lazily initialized ---
     live: OnceCell<LiveState>,
@@ -108,12 +113,23 @@ impl BoxImpl {
     /// Create BoxImpl with config and state (LiveState not initialized yet).
     ///
     /// LiveState will be lazily initialized when operations requiring it are called.
-    pub(crate) fn new(config: BoxConfig, state: BoxState, runtime: SharedRuntimeImpl) -> Self {
+    ///
+    /// # Arguments
+    /// * `config` - Box configuration
+    /// * `state` - Initial box state
+    /// * `runtime` - Shared runtime reference
+    /// * `shutdown_token` - Child token from runtime for coordinated shutdown
+    pub(crate) fn new(
+        config: BoxConfig,
+        state: BoxState,
+        runtime: SharedRuntimeImpl,
+        shutdown_token: CancellationToken,
+    ) -> Self {
         Self {
             config,
             state: RwLock::new(state),
             runtime,
-            is_shutdown: AtomicBool::new(false),
+            shutdown_token,
             live: OnceCell::new(),
         }
     }
@@ -146,9 +162,9 @@ impl BoxImpl {
     ///
     /// This is idempotent - calling start() on a Running box is a no-op.
     pub(crate) async fn start(&self) -> BoxliteResult<()> {
-        // Check if already shutdown
-        if self.is_shutdown.load(Ordering::SeqCst) {
-            return Err(BoxliteError::InvalidState(
+        // Check if already shutdown (via stop() or runtime shutdown)
+        if self.shutdown_token.is_cancelled() {
+            return Err(BoxliteError::Stopped(
                 "Handle invalidated after stop(). Use runtime.get() to get a new handle.".into(),
             ));
         }
@@ -178,9 +194,9 @@ impl BoxImpl {
     pub(crate) async fn exec(&self, command: BoxCommand) -> BoxliteResult<Execution> {
         use boxlite_shared::constants::executor as executor_const;
 
-        // Check if box is stopped before proceeding
-        if self.is_shutdown.load(Ordering::SeqCst) {
-            return Err(BoxliteError::InvalidState(
+        // Check if box is stopped before proceeding (via stop() or runtime shutdown)
+        if self.shutdown_token.is_cancelled() {
+            return Err(BoxliteError::Stopped(
                 "Handle invalidated after stop(). Use runtime.get() to get a new handle.".into(),
             ));
         }
@@ -203,15 +219,15 @@ impl BoxImpl {
         };
 
         // Set working directory from BoxOptions if not set in command
-        let command = if command.working_dir.is_none() && self.config.options.working_dir.is_some()
-        {
-            command.working_dir(self.config.options.working_dir.as_ref().unwrap())
-        } else {
-            command
+        let command = match (&command.working_dir, &self.config.options.working_dir) {
+            (None, Some(dir)) => command.working_dir(dir),
+            _ => command,
         };
 
         let mut exec_interface = live.guest_session.execution().await?;
-        let result = exec_interface.exec(command).await;
+        let result = exec_interface
+            .exec(command, self.shutdown_token.clone())
+            .await;
 
         // Instrument metrics
         live.metrics.increment_commands_executed();
@@ -240,9 +256,9 @@ impl BoxImpl {
     }
 
     pub(crate) async fn metrics(&self) -> BoxliteResult<BoxMetrics> {
-        // Check if box is stopped before proceeding
-        if self.is_shutdown.load(Ordering::SeqCst) {
-            return Err(BoxliteError::InvalidState(
+        // Check if box is stopped before proceeding (via stop() or runtime shutdown)
+        if self.shutdown_token.is_cancelled() {
+            return Err(BoxliteError::Stopped(
                 "Handle invalidated after stop(). Use runtime.get() to get a new handle.".into(),
             ));
         }
@@ -266,7 +282,15 @@ impl BoxImpl {
     }
 
     pub(crate) async fn stop(&self) -> BoxliteResult<()> {
-        self.is_shutdown.store(true, Ordering::SeqCst);
+        // Early exit if already stopped (idempotent, prevents double-counting)
+        // Note: We check status, not shutdown_token, because the token may be cancelled
+        // by runtime.shutdown() before stop() is called on each box.
+        if self.state.read().status == BoxStatus::Stopped {
+            return Ok(());
+        }
+
+        // Cancel the token - signals all in-flight operations to abort
+        self.shutdown_token.cancel();
 
         // Only try to stop VM if LiveState exists
         if let Some(live) = self.live.get() {
@@ -323,10 +347,119 @@ impl BoxImpl {
 
         tracing::info!("Stopped box {}", self.id());
 
+        // Increment runtime-wide stopped counter
+        self.runtime
+            .runtime_metrics
+            .boxes_stopped
+            .fetch_add(1, Ordering::Relaxed);
+
         if self.config.options.auto_remove {
             self.runtime.remove_box(self.id(), false)?;
         }
 
+        Ok(())
+    }
+
+    // ========================================================================
+    // FILE COPY
+    // ========================================================================
+
+    // NOTE(copy_in): copy_in cannot write to tmpfs-mounted destinations (e.g. /tmp, /dev/shm).
+    //
+    // Extraction happens on the rootfs layer, but tmpfs mounts inside the container
+    // hide those files. This is the same limitation as `docker cp`.
+    // See: https://github.com/moby/moby/issues/22020
+    //
+    // Workaround: use exec() to pipe tar into the container:
+    //   exec(["tar", "xf", "-", "-C", "/tmp"]) + stream tar bytes via stdin
+    pub(crate) async fn copy_into(
+        &self,
+        host_src: &std::path::Path,
+        container_dst: &str,
+        opts: CopyOptions,
+    ) -> BoxliteResult<()> {
+        // Check if box is stopped before proceeding
+        if self.shutdown_token.is_cancelled() {
+            return Err(BoxliteError::Stopped(
+                "Handle invalidated after stop(). Use runtime.get() to get a new handle.".into(),
+            ));
+        }
+
+        // Ensure box is running
+        let live = self.live_state().await?;
+
+        if host_src.is_dir() {
+            opts.validate_for_dir()?;
+        }
+
+        if container_dst.is_empty() {
+            return Err(BoxliteError::Config(
+                "destination path cannot be empty".into(),
+            ));
+        }
+
+        let temp_tar = self
+            .runtime
+            .layout
+            .temp_dir()
+            .join(format!("cp-in-{}.tar", self.config.id.as_str()));
+
+        build_tar_from_host(host_src, &temp_tar, &opts)?;
+
+        let mut files_iface = live.guest_session.files().await?;
+        files_iface
+            .upload_tar(
+                &temp_tar,
+                container_dst,
+                Some(self.container_id()),
+                true,
+                opts.overwrite,
+            )
+            .await?;
+
+        let _ = tokio::fs::remove_file(&temp_tar).await;
+        Ok(())
+    }
+
+    pub(crate) async fn copy_out(
+        &self,
+        container_src: &str,
+        host_dst: &std::path::Path,
+        opts: CopyOptions,
+    ) -> BoxliteResult<()> {
+        // Check if box is stopped before proceeding
+        if self.shutdown_token.is_cancelled() {
+            return Err(BoxliteError::Stopped(
+                "Handle invalidated after stop(). Use runtime.get() to get a new handle.".into(),
+            ));
+        }
+
+        // Ensure box is running
+        let live = self.live_state().await?;
+
+        if container_src.is_empty() {
+            return Err(BoxliteError::Config("source path cannot be empty".into()));
+        }
+
+        let temp_tar = self
+            .runtime
+            .layout
+            .temp_dir()
+            .join(format!("cp-out-{}.tar", self.config.id.as_str()));
+
+        let mut files_iface = live.guest_session.files().await?;
+        files_iface
+            .download_tar(
+                container_src,
+                Some(self.container_id()),
+                opts.include_parent,
+                opts.follow_symlinks,
+                &temp_tar,
+            )
+            .await?;
+
+        extract_tar_to_host(&temp_tar, host_dst, opts.overwrite)?;
+        let _ = tokio::fs::remove_file(&temp_tar).await;
         Ok(())
     }
 
@@ -425,5 +558,115 @@ impl BoxImpl {
 
         // Lock is automatically released when _guard drops
         Ok(live_state)
+    }
+}
+
+fn build_tar_from_host(
+    src: &std::path::Path,
+    tar_path: &std::path::Path,
+    opts: &CopyOptions,
+) -> BoxliteResult<()> {
+    let src = src.to_path_buf();
+    let tar_path = tar_path.to_path_buf();
+    let follow = opts.follow_symlinks;
+    let include_parent = opts.include_parent;
+
+    tokio::task::block_in_place(|| {
+        let tar_file = std::fs::File::create(&tar_path).map_err(|e| {
+            BoxliteError::Storage(format!(
+                "failed to create tar {}: {}",
+                tar_path.display(),
+                e
+            ))
+        })?;
+        let mut builder = tar::Builder::new(tar_file);
+        builder.follow_symlinks(follow);
+
+        if src.is_dir() {
+            let base = if include_parent {
+                src.file_name()
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(|| std::ffi::OsStr::new("root").to_owned())
+            } else {
+                std::ffi::OsStr::new(".").to_owned()
+            };
+            builder
+                .append_dir_all(base, &src)
+                .map_err(|e| BoxliteError::Storage(format!("failed to archive dir: {}", e)))?;
+        } else {
+            let name = src
+                .file_name()
+                .ok_or_else(|| BoxliteError::Config("source file has no name".into()))?;
+            builder
+                .append_path_with_name(&src, name)
+                .map_err(|e| BoxliteError::Storage(format!("failed to archive file: {}", e)))?;
+        }
+
+        builder
+            .finish()
+            .map_err(|e| BoxliteError::Storage(format!("failed to finish tar: {}", e)))
+    })
+}
+
+fn extract_tar_to_host(
+    tar_path: &std::path::Path,
+    dest: &std::path::Path,
+    overwrite: bool,
+) -> BoxliteResult<()> {
+    // Basic overwrite check
+    if dest.exists() && !overwrite {
+        return Err(BoxliteError::Storage(format!(
+            "destination {} exists and overwrite=false",
+            dest.display()
+        )));
+    }
+
+    tokio::task::block_in_place(|| {
+        let tar_file = std::fs::File::open(tar_path).map_err(|e| {
+            BoxliteError::Storage(format!("failed to open tar {}: {}", tar_path.display(), e))
+        })?;
+        let mut archive = tar::Archive::new(tar_file);
+        archive
+            .unpack(dest)
+            .map_err(|e| BoxliteError::Storage(format!("failed to extract archive: {}", e)))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn tar_roundtrip_file() {
+        // Multi-threaded runtime required for block_in_place
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let src_dir = tmp.path().join("src");
+            std::fs::create_dir(&src_dir).unwrap();
+            let file = src_dir.join("hello.txt");
+            std::fs::write(&file, b"hello").unwrap();
+
+            let tar_path = tmp.path().join("out.tar");
+            let opts = CopyOptions {
+                include_parent: true,
+                ..CopyOptions::default()
+            };
+            build_tar_from_host(&src_dir, &tar_path, &opts).unwrap();
+
+            let dest_dir = tmp.path().join("dest");
+            std::fs::create_dir(&dest_dir).unwrap();
+            extract_tar_to_host(&tar_path, &dest_dir, true).unwrap();
+
+            let extracted = dest_dir.join("src").join("hello.txt");
+            let data = std::fs::read_to_string(extracted).unwrap();
+            assert_eq!(data, "hello");
+        });
     }
 }

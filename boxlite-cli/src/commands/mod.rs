@@ -1,5 +1,8 @@
+pub mod cp;
 pub mod create;
+pub mod images;
 pub mod list;
+pub mod pull;
 pub mod restart;
 pub mod rm;
 pub mod run;

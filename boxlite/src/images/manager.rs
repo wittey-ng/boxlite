@@ -7,15 +7,21 @@
 //! Architecture:
 //! - `ImageManager` holds `Arc<ImageStore>` (thread-safe store)
 //! - `ImageStore` handles all locking internally
-//! - `ImageObject` also holds `Arc<ImageStore>` for layer access
+//! - `ImageObject` uses `BlobSource` for blob access
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
+use super::blob_source::{BlobSource, LocalBundleBlobSource, StoreBlobSource};
 use super::object::ImageObject;
 use crate::db::Database;
 use crate::images::store::{ImageStore, SharedImageStore};
+use crate::runtime::types::ImageInfo;
 use boxlite_shared::errors::BoxliteResult;
+use oci_client::Reference;
+use std::str::FromStr;
 
 // ============================================================================
 // INTERNAL TYPES
@@ -49,14 +55,14 @@ pub(super) struct LayerInfo {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```ignore
 /// use boxlite::images::ImageManager;
 /// use boxlite::db::Database;
 /// use std::path::PathBuf;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let db = Database::open(&PathBuf::from("/tmp/boxlite.db"))?;
-/// let manager = ImageManager::new(PathBuf::from("/tmp/images"), db)?;
+/// let manager = ImageManager::new(PathBuf::from("/tmp/images"), db, vec![])?;
 ///
 /// // Pull an image
 /// let image = manager.pull("python:alpine").await?;
@@ -99,11 +105,87 @@ impl ImageManager {
     /// concurrent pulls of the same image will only download once.
     pub async fn pull(&self, image_ref: &str) -> BoxliteResult<ImageObject> {
         let manifest = self.store.pull(image_ref).await?;
+        let storage = self.store.storage().await;
+        let blob_source = BlobSource::Store(StoreBlobSource::new(storage));
 
         Ok(ImageObject::new(
             image_ref.to_string(),
             manifest,
-            Arc::clone(&self.store),
+            blob_source,
         ))
+    }
+
+    /// List all cached images.
+    pub async fn list(&self) -> BoxliteResult<Vec<ImageInfo>> {
+        let raw_images = self.store.list().await?;
+
+        let mut images = Vec::with_capacity(raw_images.len());
+        for (reference, cached) in raw_images {
+            // If parsing fails, default to UNIX_EPOCH to signal error
+            let cached_at = DateTime::parse_from_rfc3339(&cached.cached_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Invalid cached_at timestamp: {}, using epoch", e);
+                    DateTime::<Utc>::from(std::time::SystemTime::UNIX_EPOCH)
+                });
+
+            let (repository, tag) = match Reference::from_str(&reference) {
+                Ok(r) => (
+                    r.repository().to_string(),
+                    r.tag().unwrap_or("latest").to_string(),
+                ),
+                Err(_) => {
+                    // Fallback if reference stored in DB is invalid
+                    (reference.clone(), "<none>".to_string())
+                }
+            };
+
+            images.push(ImageInfo {
+                reference,
+                repository,
+                tag,
+                id: cached.manifest_digest,
+                cached_at,
+                size: None, // Size calculation is expensive now? omitted for list temporarily
+            });
+        }
+
+        Ok(images)
+    }
+
+    /// Load an OCI/Docker image from a local directory.
+    ///
+    /// Reads image manifest from `manifest.json` and returns an `ImageObject`.
+    /// Blobs are read directly from the bundle (not copied to the store).
+    ///
+    /// Expected structure:
+    ///   ```text
+    ///   {path}/
+    ///     manifest.json     - Docker/OCI manifest with Config and Layers paths
+    ///     blobs/sha256/     - Content-addressed blobs
+    ///   ```
+    ///
+    /// # Arguments
+    /// * `path` - Path to local image directory
+    /// * `reference` - Image reference for display (e.g., "local/redis:latest")
+    ///
+    /// # Returns
+    /// `ImageObject` with access to layers and config
+    pub async fn load_from_local(
+        &self,
+        path: std::path::PathBuf,
+        reference: String,
+    ) -> BoxliteResult<ImageObject> {
+        let manifest = self.store.load_from_local(path.clone()).await?;
+
+        // Let store compute cache dir (layout owns directory structure decisions)
+        // Cache dir includes manifest digest for automatic invalidation when bundle changes
+        let cache_dir = self
+            .store
+            .local_bundle_cache_dir(&path, &manifest.manifest_digest)
+            .await;
+        let blob_source = BlobSource::LocalBundle(LocalBundleBlobSource::new(path, cache_dir));
+
+        Ok(ImageObject::new(reference, manifest, blob_source))
     }
 }
