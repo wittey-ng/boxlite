@@ -85,6 +85,13 @@ try:
 except ImportError:
     pass
 
+try:
+    from .docgeneratorbox import DocGeneratorBox, DocGeneratorBoxOptions
+
+    __all__.extend(["DocGeneratorBox", "DocGeneratorBoxOptions"])
+except ImportError:
+    pass
+
 # Sync API (greenlet-based synchronous wrappers)
 # Requires greenlet: pip install boxlite[sync]
 try:
